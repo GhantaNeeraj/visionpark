@@ -184,43 +184,67 @@ def process_video(jid:str,source:Path,line_y:float):
 
 class SlotRequest(BaseModel): polygons:list[list[list[float]]]
 
-@app.post('/api/parking/process')
-async def parking_process(file:UploadFile=File(...),polygons:str=Form('[]')):
+@app.post('/api/parking/process',status_code=202)
+async def parking_process(background_tasks:BackgroundTasks,file:UploadFile=File(...),polygons:str=Form('[]')):
     import json
     source=await save_upload(file,{'.jpg','.jpeg','.png','.webp'})
     try: slots=json.loads(polygons)
     except Exception: source.unlink(missing_ok=True); raise HTTPException(422,'polygons must be valid JSON')
-    image=cv2.imread(str(source)); source.unlink(missing_ok=True)
-    if image is None: raise HTTPException(400,'Image could not be decoded')
-    if not isinstance(slots,list): raise HTTPException(422,'polygons must be a JSON list')
-    try:
-        yolo=get_model(); device=0 if __import__('torch').cuda.is_available() else 'cpu'; result=yolo.predict(image,classes=[2,5,7],conf=.35,imgsz=960,agnostic_nms=True,device=device,verbose=False)[0]
-    except Exception as exc: raise HTTPException(503,str(exc))
-    h,w=image.shape[:2]; boxes=result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.empty((0,4)); vehicle_boxes=[[float(x1/w),float(y1/h),float(x2/w),float(y2/h)] for x1,y1,x2,y2 in boxes]; auto_configured=False
-    if not slots:
-        slots=estimate_parking_grid(image,boxes)
-        if not slots: slots=estimate_slots_from_markings(image)
-        auto_configured=bool(slots)
-    needs_manual=False
-    occupancy=[]
-    for idx,poly in enumerate(slots):
+    if not isinstance(slots,list): source.unlink(missing_ok=True); raise HTTPException(422,'polygons must be a JSON list')
+    for poly in slots:
         pts=np.array(poly,dtype=np.float32)
-        if pts.ndim!=2 or pts.shape[0]<3 or pts.shape[1]!=2 or np.any(pts<0) or np.any(pts>1): raise HTTPException(422,'Each slot must be a polygon with 3+ normalized [0,1] points')
-        px=(pts*np.array([w,h])).astype(np.int32); mask=np.zeros((h,w),np.uint8); cv2.fillPoly(mask,[px],1); occupied=False
+        if pts.ndim!=2 or pts.shape[0]<3 or pts.shape[1]!=2 or np.any(pts<0) or np.any(pts>1):
+            source.unlink(missing_ok=True); raise HTTPException(422,'Each slot must be a polygon with 3+ normalized [0,1] points')
+    jid=uuid.uuid4().hex
+    jobs[jid]={'job_id':jid,'kind':'parking','status':'queued','progress':0,'filename':file.filename,'created_at':time.time(),'source_path':str(source)}
+    background_tasks.add_task(process_parking,jid,source,slots)
+    return {'job_id':jid,'kind':'parking','status':'queued','progress':0}
+
+def process_parking(jid:str,source:Path,slots:list):
+    j=jobs[jid]; started=time.perf_counter()
+    try:
+        image=cv2.imread(str(source))
+        if image is None: raise RuntimeError('Image could not be decoded')
+        j.update(status='running',progress=5)
+        yolo=get_model(); device=0 if __import__('torch').cuda.is_available() else 'cpu'
+        result=yolo.predict(image,classes=[2,5,7],conf=.35,imgsz=640,agnostic_nms=True,device=device,verbose=False)[0]
+        h,w=image.shape[:2]; boxes=result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.empty((0,4))
+        vehicle_boxes=[[float(x1/w),float(y1/h),float(x2/w),float(y2/h)] for x1,y1,x2,y2 in boxes]
+        auto_configured=False
+        if not slots:
+            slots=estimate_parking_grid(image,boxes)
+            if not slots: slots=estimate_slots_from_markings(image)
+            auto_configured=bool(slots)
+        occupancy=[]
+        for idx,poly in enumerate(slots):
+            pts=np.array(poly,dtype=np.float32); px=(pts*np.array([w,h])).astype(np.int32)
+            mask=np.zeros((h,w),np.uint8); cv2.fillPoly(mask,[px],1); occupied=False
+            for x1,y1,x2,y2 in boxes:
+                bx1=max(0,int(np.floor(x1))); by1=max(0,int(np.floor(y1))); bx2=min(w,int(np.ceil(x2))); by2=min(h,int(np.ceil(y2)))
+                if bx2<=bx1 or by2<=by1: continue
+                crop=mask[by1:by2,bx1:bx2]
+                center_inside=bool(mask[min(h-1,max(0,int((y1+y2)/2))),min(w-1,max(0,int((x1+x2)/2)))])
+                if center_inside or crop.sum()/((bx2-bx1)*(by2-by1))>=.18: occupied=True; break
+            occupancy.append({'slot':idx+1,'occupied':occupied})
+            color=(47,80,238) if occupied else (63,213,151); overlay=image.copy()
+            cv2.fillPoly(overlay,[px],color); cv2.addWeighted(overlay,.23,image,.77,0,image); cv2.polylines(image,[px],True,color,3)
+            cx,cy=np.mean(px,axis=0).astype(int); cv2.putText(image,str(idx+1),(cx,cy),cv2.FONT_HERSHEY_SIMPLEX,.8,(255,255,255),2)
         for x1,y1,x2,y2 in boxes:
-            bx1=max(0,int(np.floor(x1))); by1=max(0,int(np.floor(y1))); bx2=min(w,int(np.ceil(x2))); by2=min(h,int(np.ceil(y2)))
-            if bx2<=bx1 or by2<=by1: continue
-            crop=mask[by1:by2,bx1:bx2]
-            center_inside=bool(mask[min(h-1,max(0,int((y1+y2)/2))),min(w-1,max(0,int((x1+x2)/2)))])
-            if center_inside or crop.sum()/((bx2-bx1)*(by2-by1))>=.18: occupied=True; break
-        occupancy.append({'slot':idx+1,'occupied':occupied})
-        color=(47,80,238) if occupied else (63,213,151); overlay=image.copy(); cv2.fillPoly(overlay,[px],color); cv2.addWeighted(overlay,.23,image,.77,0,image); cv2.polylines(image,[px],True,color,3); cx,cy=np.mean(px,axis=0).astype(int); cv2.putText(image,str(idx+1),(cx,cy),cv2.FONT_HERSHEY_SIMPLEX,.8,(255,255,255),2)
-    for x1,y1,x2,y2 in boxes:
-        cv2.rectangle(image,(int(x1),int(y1)),(int(x2),int(y2)),(50,80,240),3)
-        cv2.putText(image,'Vehicle',(int(x1),max(20,int(y1)-8)),cv2.FONT_HERSHEY_SIMPLEX,.65,(50,80,240),2)
-    jid=uuid.uuid4().hex; out=RESULTS/f'{jid}.jpg'; csv=RESULTS/f'{jid}.csv'; cv2.imwrite(str(out),image)
-    pd.DataFrame(occupancy).to_csv(csv,index=False); occupied=sum(x['occupied'] for x in occupancy)
-    return {'job_id':jid,'status':'completed','auto_configured':auto_configured,'needs_manual_configuration':False,'message':None if slots else 'No clear parking bay markings or repeated vehicle pattern were visible, so this image did not provide a reliable slot total. Try a wider, clearer parking-lot image.','total_slots':len(occupancy),'occupied':occupied,'available':len(occupancy)-occupied,'occupancy_percent':round(occupied/len(occupancy)*100,1) if occupancy else 0,'slots':occupancy,'polygons':slots,'detected_vehicles':len(boxes),'vehicle_boxes':vehicle_boxes,'image_url':f'/api/files/{jid}/image','csv_url':f'/api/files/{jid}/csv'}
+            cv2.rectangle(image,(int(x1),int(y1)),(int(x2),int(y2)),(50,80,240),3)
+            cv2.putText(image,'Vehicle',(int(x1),max(20,int(y1)-8)),cv2.FONT_HERSHEY_SIMPLEX,.65,(50,80,240),2)
+        j['progress']=85
+        out=RESULTS/f'{jid}.jpg'; csv=RESULTS/f'{jid}.csv'; cv2.imwrite(str(out),image)
+        pd.DataFrame(occupancy).to_csv(csv,index=False); occupied=sum(x['occupied'] for x in occupancy)
+        j.update(status='completed',progress=100,auto_configured=auto_configured,needs_manual_configuration=False,
+            message=None if slots else 'No clear parking bay markings or repeated vehicle pattern were visible, so this image did not provide a reliable slot total. Try a wider, clearer parking-lot image.',
+            total_slots=len(occupancy),occupied=occupied,available=len(occupancy)-occupied,
+            occupancy_percent=round(occupied/len(occupancy)*100,1) if occupancy else 0,slots=occupancy,polygons=slots,
+            detected_vehicles=len(boxes),vehicle_boxes=vehicle_boxes,image_url=f'/api/files/{jid}/image',csv_url=f'/api/files/{jid}/csv',
+            processing_seconds=round(time.perf_counter()-started,2))
+    except Exception as exc:
+        log.exception('Parking analysis failed'); j.update(status='error',progress=100,error=f'Parking analysis failed: {exc}')
+    finally:
+        source.unlink(missing_ok=True)
 
 @app.get('/api/jobs/{jid}')
 def job_status(jid:str):
