@@ -13,9 +13,10 @@ from pydantic import BaseModel
 ROOT=Path(__file__).resolve().parents[1]; UPLOADS=ROOT/'uploads'; RESULTS=ROOT/'results'
 UPLOADS.mkdir(exist_ok=True); RESULTS.mkdir(exist_ok=True)
 MAX_BYTES=int(os.getenv('MAX_UPLOAD_MB','500'))*1024*1024
-MODEL_NAME=os.getenv('YOLO_MODEL',str(ROOT/'yolo11n.pt'))
-MODEL_PATH=Path(MODEL_NAME)
-if not MODEL_PATH.is_absolute(): MODEL_PATH=ROOT/MODEL_PATH
+MODEL_NAME=os.getenv('YOLO_MODEL','yolo11n.pt')
+MODEL_SETTING=Path(MODEL_NAME)
+MODEL_PATH=MODEL_SETTING if MODEL_SETTING.is_absolute() else ROOT/MODEL_SETTING
+MODEL_SOURCE=str(MODEL_PATH) if MODEL_PATH.is_file() else MODEL_NAME
 logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO')); log=logging.getLogger('visionpark')
 app=FastAPI(title='VisionPark AI API',version='1.0.0')
 app.add_middleware(CORSMiddleware,allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173,http://127.0.0.1:5173').split(','),allow_methods=['*'],allow_headers=['*'])
@@ -68,10 +69,10 @@ def get_model():
         if model is None:
             try:
                 from ultralytics import YOLO
-                candidate=YOLO(str(MODEL_PATH))
+                candidate=YOLO(MODEL_SOURCE)
                 # Force actual model initialization; no silent mocked fallback.
                 model=candidate
-                log.info('Loaded model %s',MODEL_NAME)
+                log.info('Loaded model %s',MODEL_SOURCE)
             except Exception as exc: raise RuntimeError(f'Could not load {MODEL_NAME}: {exc}') from exc
     return model
 

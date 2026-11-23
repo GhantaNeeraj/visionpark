@@ -39,6 +39,18 @@ npm run dev
 
 Open http://localhost:5173. Sign in with a valid email and any non-empty password. This is prototype-only session authentication stored in `sessionStorage`.
 
+## Deploy with Vercel + Render
+
+Vercel hosts the Vite frontend; it does not automatically host this separate FastAPI/OpenCV/YOLO backend. If the frontend uses the default `127.0.0.1` API address, a visitor's browser will try to reach that visitor's own computer, and uploads will fail.
+
+1. Push the project to a Git repository connected to Vercel and Render. `render.yaml` defines the VisionPark FastAPI service, installs dependencies, fetches YOLO11n weights during the build, and checks `/api/health`.
+2. In Render, create a Blueprint from the repository using `render.yaml`. When prompted for `CORS_ORIGINS`, enter the exact Vercel site origin, such as `https://your-project.vercel.app` (no trailing slash). Select a service plan with enough memory for PyTorch/YOLO. The model is not committed to Git because `*.pt` is ignored; the Render build fetches it.
+3. Wait for the backend service to deploy. Confirm `https://YOUR-BACKEND.onrender.com/api/health` returns JSON with `"status":"ok"`.
+4. In Vercel, open **Project → Settings → Environment Variables** and add `VITE_API_URL=https://YOUR-BACKEND.onrender.com` for Production (and Preview if needed). Redeploy the Vite site after setting the variable because Vite embeds it during the build.
+5. Test an image and a small video. The browser sends uploads directly to the FastAPI service; that host must accept the file size and have enough memory for inference.
+
+This prototype keeps jobs and generated files in process/local storage. Use one backend instance; restarting or scaling to multiple instances can lose job state and generated results. For production, move uploads/results to persistent object storage and jobs to a shared queue/database. See the [Vercel Vite deployment guide](https://vercel.com/docs/frameworks/frontend/vite), [Vercel Function limits](https://vercel.com/docs/functions/limitations), and [Render FastAPI deployment guide](https://render.com/docs/deploy-fastapi).
+
 ## Use the workspace
 
 - **Vehicle video:** drop or select MP4, AVI, MOV, or MKV. The app automatically opens Vehicle Counter and submits a background job. YOLO vehicle detections are associated by Ultralytics ByteTrack; a vehicle is counted once when its tracked center crosses the virtual line at 58% of frame height. The result includes counts by category, annotated MP4, and CSV.
@@ -56,7 +68,7 @@ Backend settings are environment variables:
 | `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated allowed frontend origins |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 
-Frontend API URL defaults to `http://127.0.0.1:8000`; override at build time using `VITE_API_URL`.
+Frontend API URL defaults to `http://127.0.0.1:8000`; override at build time using `VITE_API_URL`. `.env.example` shows the local default.
 
 Uploads are temporary and removed after processing. Results live under `backend/results` and are ignored by Git. This local prototype does not include database accounts, cloud storage, authentication hardening, job persistence across restarts, or live camera capture.
 
