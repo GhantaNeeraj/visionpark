@@ -30,7 +30,7 @@ def estimate_parking_grid(image:np.ndarray,boxes:np.ndarray)->list[list[list[flo
     not guessed, because there is no reliable boundary evidence for them.
     """
     h,w=image.shape[:2]
-    if len(boxes)<3: return []
+    if len(boxes)<2: return []
     centers=np.column_stack(((boxes[:,0]+boxes[:,2])/2,(boxes[:,1]+boxes[:,3])/2))
     centers=centers[np.argsort(centers[:,1])]
     rows=[]
@@ -61,7 +61,39 @@ def estimate_parking_grid(image:np.ndarray,boxes:np.ndarray)->list[list[list[flo
             top=max(0,cy-slot_h/2); bottom=min(h,cy+slot_h/2)
             if right-left<w*.035 or bottom-top<h*.04: continue
             polygons.append([[left/w,top/h],[right/w,top/h],[right/w,bottom/h],[left/w,bottom/h]])
-    return polygons if 3<=len(polygons)<=80 else []
+    return polygons if 2<=len(polygons)<=80 else []
+
+def estimate_slots_from_markings(image:np.ndarray)->list[list[list[float]]]:
+    """Best-effort stall proposals from long, visible painted line segments."""
+    h,w=image.shape[:2]
+    gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+    edges=cv2.Canny(cv2.GaussianBlur(gray,(5,5),0),45,135)
+    lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(35,min(h,w)//14),
+                          minLineLength=max(28,int(min(h,w)*.055)),maxLineGap=max(12,int(min(h,w)*.035)))
+    if lines is None: return []
+    vertical=[]; horizontal=[]
+    for raw in lines[:,0,:]:
+        x1,y1,x2,y2=map(int,raw); dx=x2-x1; dy=y2-y1; length=(dx*dx+dy*dy)**.5
+        if length<min(w,h)*.055: continue
+        angle=abs(np.degrees(np.arctan2(dy,dx)))
+        if angle<12 or angle>168: horizontal.append((x1+x2)/2)
+        elif 76<angle<104: vertical.append((y1+y2)/2)
+    def merge(values,scale):
+        values=sorted(values); groups=[]
+        for value in values:
+            if not groups or value-float(np.mean(groups[-1]))>scale: groups.append([value])
+            else: groups[-1].append(value)
+        return [float(np.mean(g)) for g in groups if len(g)>=1]
+    xs=merge(horizontal,max(5,w*.012)); ys=merge(vertical,max(5,h*.012))
+    slots=[]
+    for y1,y2 in zip(ys,ys[1:]):
+        sh=y2-y1
+        if not h*.07<=sh<=h*.38: continue
+        for x1,x2 in zip(xs,xs[1:]):
+            sw=x2-x1; ratio=sw/max(1,sh)
+            if not w*.035<=sw<=w*.28 or not .55<=ratio<=3.8: continue
+            slots.append([[x1/w,y1/h],[x2/w,y1/h],[x2/w,y2/h],[x1/w,y2/h]])
+    return slots[:80]
 
 def get_model():
     global model
@@ -166,8 +198,10 @@ async def parking_process(file:UploadFile=File(...),polygons:str=Form('[]')):
     except Exception as exc: raise HTTPException(503,str(exc))
     h,w=image.shape[:2]; boxes=result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.empty((0,4)); auto_configured=False
     if not slots:
-        slots=estimate_parking_grid(image,boxes); auto_configured=bool(slots)
-    needs_manual=not bool(slots)
+        slots=estimate_parking_grid(image,boxes)
+        if not slots: slots=estimate_slots_from_markings(image)
+        auto_configured=bool(slots)
+    needs_manual=False
     occupancy=[]
     for idx,poly in enumerate(slots):
         pts=np.array(poly,dtype=np.float32)
@@ -183,7 +217,7 @@ async def parking_process(file:UploadFile=File(...),polygons:str=Form('[]')):
         color=(47,80,238) if occupied else (63,213,151); overlay=image.copy(); cv2.fillPoly(overlay,[px],color); cv2.addWeighted(overlay,.23,image,.77,0,image); cv2.polylines(image,[px],True,color,3); cx,cy=np.mean(px,axis=0).astype(int); cv2.putText(image,str(idx+1),(cx,cy),cv2.FONT_HERSHEY_SIMPLEX,.8,(255,255,255),2)
     jid=uuid.uuid4().hex; out=RESULTS/f'{jid}.jpg'; csv=RESULTS/f'{jid}.csv'; cv2.imwrite(str(out),image)
     pd.DataFrame(occupancy).to_csv(csv,index=False); occupied=sum(x['occupied'] for x in occupancy)
-    return {'job_id':jid,'status':'completed','auto_configured':auto_configured,'needs_manual_configuration':needs_manual,'message':'Could not confidently estimate the marked bays. Draw the spaces manually, then analyze again.' if needs_manual else None,'total_slots':len(occupancy),'occupied':occupied,'available':len(occupancy)-occupied,'occupancy_percent':round(occupied/len(occupancy)*100,1) if occupancy else 0,'slots':occupancy,'polygons':slots,'image_url':f'/api/files/{jid}/image','csv_url':f'/api/files/{jid}/csv'}
+    return {'job_id':jid,'status':'completed','auto_configured':auto_configured,'needs_manual_configuration':False,'message':None if slots else 'No clear parking bay markings or repeated vehicle pattern were visible, so this image did not provide a reliable slot total. Try a wider, clearer parking-lot image.','total_slots':len(occupancy),'occupied':occupied,'available':len(occupancy)-occupied,'occupancy_percent':round(occupied/len(occupancy)*100,1) if occupancy else 0,'slots':occupancy,'polygons':slots,'image_url':f'/api/files/{jid}/image','csv_url':f'/api/files/{jid}/csv'}
 
 @app.get('/api/jobs/{jid}')
 def job_status(jid:str):

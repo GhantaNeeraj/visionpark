@@ -12,5 +12,9 @@ services:
         value: 3.11.11
       - key: YOLO_MODEL
         value: yolo11n.pt
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
       - key: CORS_ORIGINS
         sync: false

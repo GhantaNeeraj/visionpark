@@ -2,6 +2,10 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 opencv-python-headless>=4.10
+# Render's free CPU instance should not download CUDA builds of PyTorch.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
 ultralytics>=8.3
 numpy>=1.26
 pandas>=2.2
